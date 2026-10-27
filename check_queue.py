@@ -1,6 +1,8 @@
+import asyncio
 import os
 import sys
 import time
+import random
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -13,9 +15,6 @@ except ModuleNotFoundError:
     import subprocess
     subprocess.run([sys.executable, "-m", "pip", "install", "playwright>=1.40.0"], check=True)
     from playwright.async_api import async_playwright
-
-import asyncio
-import argparse
 
 # Запобігання засинанню Windows (екран може згаснути, але система та інтернет не заснуть)
 if os.name == 'nt':
@@ -114,14 +113,24 @@ async def check_slots(save_screenshot: bool = True) -> bool:
         page = await context.new_page()
 
         days_data = None
+        rate_limited = False
+
         async def on_response(res):
-            nonlocal days_data
-            if res.url.endswith("/solutions/e-queue") and res.request.method == "POST":
+            nonlocal days_data, rate_limited
+            if res.status == 429:
+                rate_limited = True
+                log("⚠️ Отримано HTTP 429 (Too many requests) від сервера.")
+            elif res.url.endswith("/solutions/e-queue") and res.request.method == "POST":
                 try:
-                    data = await res.json()
-                    if isinstance(data, dict) and "days" in data:
-                        days_data = data["days"]
-                        log(f"AJAX response 'days': {days_data}")
+                    text = await res.text()
+                    if "Too many requests" in text:
+                        rate_limited = True
+                        log("⚠️ Сервер відхилив запит: 'Too many requests'.")
+                    else:
+                        data = await res.json()
+                        if isinstance(data, dict) and "days" in data:
+                            days_data = data["days"]
+                            log(f"AJAX response 'days': {days_data}")
                 except Exception:
                     pass
 
@@ -129,7 +138,17 @@ async def check_slots(save_screenshot: bool = True) -> bool:
 
         try:
             log(f"Navigating to {URL}...")
-            await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+            resp = await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+
+            # Перевірка на Rate Limiting при відкритті сторінки
+            if resp and resp.status == 429:
+                log("⚠️ Сервер повернув 429 Too many requests при завантаженні сторінки. Спробуємо в наступному циклі.")
+                return False
+
+            content = await page.content()
+            if "Too many requests" in content:
+                log("⚠️ Сайт тимчасово обмежив запити (Too many requests). Спробуємо в наступному циклі.")
+                return False
 
             # Wait up to 15s for Cloudflare or page render
             for _ in range(15):
@@ -165,21 +184,44 @@ async def check_slots(save_screenshot: bool = True) -> bool:
                 await page.screenshot(path="debug_screen.png")
                 return False
 
+            # Очікуємо, поки Alpine.js прив'яжеться до форми (щоб запит не зависав зі спінером)
+            try:
+                await page.wait_for_function(
+                    '() => { const f = document.querySelector("#services"); return !!(f && f._x_dataStack && f._x_dataStack[0]); }',
+                    timeout=8000
+                )
+            except Exception:
+                pass
+
             log(f"Selecting service: '{SERVICE_TEXT}'...")
             try:
                 await page.select_option("select#service", label=SERVICE_TEXT)
             except Exception:
                 await page.select_option("select#service", value="4")
 
+            # Переконуємось, що Alpine getDays спрацював
+            try:
+                await page.evaluate('''() => {
+                    const f = document.querySelector("#services");
+                    if (f && f._x_dataStack && f._x_dataStack[0]) {
+                        const alp = f._x_dataStack[0];
+                        if (alp.service !== "4") alp.service = "4";
+                        if (typeof alp.getDays === "function") alp.getDays();
+                    }
+                }''')
+            except Exception:
+                pass
+
             log("Waiting for server response and calendar slots...")
 
-            # Очікуємо точного підтвердження: або "всі місця зайняті", або список доступних днів
             is_busy = False
             slots_available = False
             available_dates = []
 
-            for _ in range(25):
-                await asyncio.sleep(1)
+            for _ in range(20):
+                if rate_limited:
+                    log("⚠️ Запит потрапив під обмеження частоти (Rate Limit). Пропускаємо спробу.")
+                    return False
 
                 # 1. Перевірка прямої відповіді API сервера
                 if days_data is not None:
@@ -205,6 +247,8 @@ async def check_slots(save_screenshot: bool = True) -> bool:
                     available_dates = valid_dates
                     break
 
+                await asyncio.sleep(1)
+
             screenshot_path = "slot_alert.png"
             if save_screenshot:
                 await page.screenshot(path=screenshot_path)
@@ -225,8 +269,7 @@ async def check_slots(save_screenshot: bool = True) -> bool:
                 send_telegram(msg, screenshot_path if save_screenshot else None)
                 return True
             else:
-                # Якщо минуло 25 секунд, а сайт все ще показує спінер (завис або повільний інтернет)
-                log("⚠️ Сайт занадто довго завантажує дані (спінер все ще крутиться). Пропускаємо, щоб не надсилати хибну тривогу.")
+                log("⚠️ Сервер не встиг надіслати дати або тимчасово перевантажений. Пропускаємо, щоб не надсилати хибну тривогу.")
                 return False
 
         except Exception as e:
@@ -239,7 +282,7 @@ async def check_slots(save_screenshot: bool = True) -> bool:
 async def main():
     parser = argparse.ArgumentParser(description="Passport Service Queue Monitor")
     parser.add_argument("--loop", action="store_true", help="Run continuously in a loop")
-    parser.add_argument("--interval", type=int, default=180, help="Check interval in seconds when in loop mode (default: 180)")
+    parser.add_argument("--interval", type=int, default=210, help="Check interval in seconds when in loop mode (default: 210 = 3.5 min)")
     args = parser.parse_args()
 
     sys.stdout.reconfigure(encoding='utf-8')
@@ -248,7 +291,7 @@ async def main():
     if not args.loop:
         await check_slots()
     else:
-        log(f"Continuous loop mode active. Checking every {args.interval} seconds ({args.interval // 60} min).")
+        log(f"Continuous loop mode active. Base interval: {args.interval}s (~{args.interval // 60} min).")
         last_notified = 0
         while True:
             try:
@@ -257,13 +300,17 @@ async def main():
                     now = time.time()
                     if now - last_notified > 600:
                         last_notified = now
-                await asyncio.sleep(args.interval)
             except KeyboardInterrupt:
                 log("Bot stopped by user.")
                 break
             except Exception as e:
                 log(f"Unexpected error in loop: {e}")
-                await asyncio.sleep(args.interval)
+
+            # Додаємо невеликий випадковий джитер (10-30 сек), щоб сайт не блокував через чіткий таймер робота
+            jitter = random.randint(10, 30)
+            sleep_time = args.interval + jitter
+            log(f"Очікування {sleep_time} сек до наступної перевірки...")
+            await asyncio.sleep(sleep_time)
 
 if __name__ == "__main__":
     asyncio.run(main())
