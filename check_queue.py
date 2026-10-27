@@ -57,10 +57,11 @@ async def check_slots(save_screenshot: bool = True) -> bool:
                 '--disable-setuid-sandbox',
                 '--disable-blink-features=AutomationControlled',
                 '--disable-infobars',
-                '--window-size=1920,1080'
+                '--window-size=1920,1080',
+                '--disable-extensions',
+                '--disable-dev-shm-usage',
             ]
         }
-        # In case running on local Windows machine without standalone playwright browser installed
         chrome_win = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
         if os.name == 'nt' and os.path.exists(chrome_win):
             launch_kwargs["executable_path"] = chrome_win
@@ -75,6 +76,8 @@ async def check_slots(save_screenshot: bool = True) -> bool:
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['uk-UA', 'uk', 'en-US', 'en'] });
         """)
 
         page = await context.new_page()
@@ -96,14 +99,44 @@ async def check_slots(save_screenshot: bool = True) -> bool:
         try:
             log(f"Navigating to {URL}...")
             await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-            await asyncio.sleep(4)
 
-            service_select = await page.query_selector("select#service")
+            # Wait up to 15s for Cloudflare or page render
+            for _ in range(15):
+                title = await page.title()
+                if "Just a moment" in title or "Cloudflare" in title:
+                    log(f"Cloudflare challenge detected ('{title}'). Waiting...")
+                    # Try to click Cloudflare checkbox if present in iframe
+                    try:
+                        frames = page.frames
+                        for f in frames:
+                            if "challenges.cloudflare.com" in f.url:
+                                checkbox = await f.query_selector("input[type=checkbox], .ctp-checkbox-label, #challenge-stage")
+                                if checkbox:
+                                    log("Found Cloudflare turnstile checkbox, clicking...")
+                                    await checkbox.click()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2)
+                else:
+                    break
+
+            # Try to find select#service with wait
+            service_select = None
+            try:
+                await page.wait_for_selector("select#service", timeout=12000)
+                service_select = await page.query_selector("select#service")
+            except Exception:
+                pass
+
+            title = await page.title()
+            log(f"Current page title: '{title}'")
+
             if not service_select:
-                log("⚠️ select#service not found on page! Possible Cloudflare block or site layout update.")
+                log("⚠️ select#service not found on page!")
+                await page.screenshot(path="debug_screen.png")
                 content = await page.content()
-                if "challenges.cloudflare.com" in content or "Just a moment..." in content:
-                    log("Cloudflare challenge screen encountered.")
+                if "challenges.cloudflare.com" in content or "Just a moment" in content:
+                    log("❌ Blocked by Cloudflare interactive challenge on GitHub runner IP.")
                 return False
 
             log(f"Selecting service: '{SERVICE_TEXT}'...")
@@ -121,8 +154,6 @@ async def check_slots(save_screenshot: bool = True) -> bool:
                 await page.screenshot(path=screenshot_path)
 
             has_busy_text = BUSY_TEXT in content
-
-            # Slots exist if either the busy text is ABSENT or days_data contains available items
             slots_available = not has_busy_text or (days_data is not None and len(days_data) > 0)
 
             if slots_available:
@@ -143,6 +174,7 @@ async def check_slots(save_screenshot: bool = True) -> bool:
 
         except Exception as e:
             log(f"Error during check: {e}")
+            await page.screenshot(path="debug_screen.png")
             return False
         finally:
             await browser.close()
@@ -157,10 +189,8 @@ async def main():
     log("Starting Passport Queue Bot...")
 
     if not args.loop:
-        # Single run (perfect for GitHub Actions cron)
         await check_slots()
     else:
-        # Continuous daemon mode (for local machine or VPS)
         log(f"Continuous loop mode active. Checking every {args.interval} seconds.")
         last_notified = 0
         while True:
@@ -168,7 +198,6 @@ async def main():
                 slots = await check_slots()
                 if slots:
                     now = time.time()
-                    # Throttle repeat alerts (once every 10 minutes if still open)
                     if now - last_notified > 600:
                         last_notified = now
                 await asyncio.sleep(args.interval)
