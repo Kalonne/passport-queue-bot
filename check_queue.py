@@ -1,12 +1,21 @@
-import asyncio
-import argparse
 import os
 import sys
 import time
 import urllib.request
 import urllib.parse
 from datetime import datetime
-from playwright.async_api import async_playwright
+
+# Автоматичне встановлення playwright, якщо бібліотека ще не встановлена
+try:
+    from playwright.async_api import async_playwright
+except ModuleNotFoundError:
+    print("[INFO] Бібліотеку 'playwright' не знайдено. Автоматично встановлюю...", flush=True)
+    import subprocess
+    subprocess.run([sys.executable, "-m", "pip", "install", "playwright>=1.40.0"], check=True)
+    from playwright.async_api import async_playwright
+
+import asyncio
+import argparse
 
 # Запобігання засинанню Windows (екран може згаснути, але система та інтернет не заснуть)
 if os.name == 'nt':
@@ -88,6 +97,7 @@ async def check_slots(save_screenshot: bool = True) -> bool:
                 browser = await p.chromium.launch(**launch_kwargs)
             else:
                 raise e
+
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             locale="uk-UA",

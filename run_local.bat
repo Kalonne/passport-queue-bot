@@ -1,5 +1,7 @@
 @echo off
 chcp 65001 > nul
+cd /d "%~dp0"
+
 echo ====================================================
 echo Паспортний сервіс (Мюнхен) — Автоматичний моніторинг
 echo ====================================================
@@ -8,15 +10,15 @@ echo ====================================================
 python --version >nul 2>&1
 if errorlevel 1 goto :no_python
 
-echo [1/2] Перевірка бібліотек...
-pip install -r requirements.txt
+echo [1/3] Перевірка та встановлення бібліотеки playwright...
+python -m pip install -r requirements.txt
 
-echo [2/2] Перевірка браузера Chromium...
-playwright install chromium
+echo [2/3] Перевірка браузера Chromium...
+python -m playwright install chromium
 
 echo.
 echo ====================================================
-echo Запуск моніторингу черги (кожні 3 хвилини)
+echo [3/3] Запуск моніторингу черги (кожні 3 хвилини)
 echo ====================================================
 echo.
 
