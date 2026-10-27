@@ -18,11 +18,11 @@ python -m playwright install chromium
 
 echo.
 echo ====================================================
-echo [3/3] Запуск моніторингу черги (~3.5 хвилини)
+echo [3/3] Запуск моніторингу черги (кожні 5 хвилин)
 echo ====================================================
 echo.
 
-python check_queue.py --loop --interval 210
+python check_queue.py --loop --interval 300
 goto :end
 
 :no_python
