@@ -76,7 +76,18 @@ async def check_slots(save_screenshot: bool = True) -> bool:
         if os.name == 'nt' and os.path.exists(chrome_win):
             launch_kwargs["executable_path"] = chrome_win
 
-        browser = await p.chromium.launch(**launch_kwargs)
+        try:
+            browser = await p.chromium.launch(**launch_kwargs)
+        except Exception as e:
+            if "Executable doesn't exist" in str(e) or "playwright install" in str(e):
+                log("Chromium browser not found, automatically downloading (one-time setup)...")
+                import subprocess
+                subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+                if "executable_path" in launch_kwargs:
+                    del launch_kwargs["executable_path"]
+                browser = await p.chromium.launch(**launch_kwargs)
+            else:
+                raise e
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             locale="uk-UA",
