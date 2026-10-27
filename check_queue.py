@@ -8,6 +8,16 @@ import urllib.parse
 from datetime import datetime
 from playwright.async_api import async_playwright
 
+# Запобігання засинанню Windows (екран може згаснути, але система та інтернет не заснуть)
+if os.name == 'nt':
+    try:
+        import ctypes
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+    except Exception:
+        pass
+
 URL = "https://munich.pasport.org.ua/solutions/e-queue"
 BUSY_TEXT = "Вибачте, на даний момент всі місця зайняті!"
 SERVICE_TEXT = "Закордонний паспорт та (або) ID-картка"
@@ -105,7 +115,6 @@ async def check_slots(save_screenshot: bool = True) -> bool:
                 title = await page.title()
                 if "Just a moment" in title or "Cloudflare" in title:
                     log(f"Cloudflare challenge detected ('{title}'). Waiting...")
-                    # Try to click Cloudflare checkbox if present in iframe
                     try:
                         frames = page.frames
                         for f in frames:
@@ -120,7 +129,6 @@ async def check_slots(save_screenshot: bool = True) -> bool:
                 else:
                     break
 
-            # Try to find select#service with wait
             service_select = None
             try:
                 await page.wait_for_selector("select#service", timeout=12000)
@@ -182,7 +190,7 @@ async def check_slots(save_screenshot: bool = True) -> bool:
 async def main():
     parser = argparse.ArgumentParser(description="Passport Service Queue Monitor")
     parser.add_argument("--loop", action="store_true", help="Run continuously in a loop")
-    parser.add_argument("--interval", type=int, default=60, help="Check interval in seconds when in loop mode (default: 60)")
+    parser.add_argument("--interval", type=int, default=180, help="Check interval in seconds when in loop mode (default: 180)")
     args = parser.parse_args()
 
     sys.stdout.reconfigure(encoding='utf-8')
@@ -191,7 +199,7 @@ async def main():
     if not args.loop:
         await check_slots()
     else:
-        log(f"Continuous loop mode active. Checking every {args.interval} seconds.")
+        log(f"Continuous loop mode active. Checking every {args.interval} seconds ({args.interval // 60} min).")
         last_notified = 0
         while True:
             try:
