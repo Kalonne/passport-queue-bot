@@ -163,9 +163,6 @@ async def check_slots(save_screenshot: bool = True) -> bool:
             if not service_select:
                 log("⚠️ select#service not found on page!")
                 await page.screenshot(path="debug_screen.png")
-                content = await page.content()
-                if "challenges.cloudflare.com" in content or "Just a moment" in content:
-                    log("❌ Blocked by Cloudflare interactive challenge on GitHub runner IP.")
                 return False
 
             log(f"Selecting service: '{SERVICE_TEXT}'...")
@@ -174,31 +171,62 @@ async def check_slots(save_screenshot: bool = True) -> bool:
             except Exception:
                 await page.select_option("select#service", value="4")
 
-            log("Waiting for calendar slots response...")
-            await asyncio.sleep(5)
+            log("Waiting for server response and calendar slots...")
 
-            content = await page.content()
+            # Очікуємо точного підтвердження: або "всі місця зайняті", або список доступних днів
+            is_busy = False
+            slots_available = False
+            available_dates = []
+
+            for _ in range(25):
+                await asyncio.sleep(1)
+
+                # 1. Перевірка прямої відповіді API сервера
+                if days_data is not None:
+                    if len(days_data) == 0:
+                        is_busy = True
+                        break
+                    else:
+                        slots_available = True
+                        available_dates = days_data
+                        break
+
+                # 2. Перевірка тексту повідомлення на самій сторінці
+                content = await page.content()
+                if BUSY_TEXT in content:
+                    is_busy = True
+                    break
+
+                # 3. Перевірка наявності доступних дат у випадаючому списку дат
+                date_options = await page.query_selector_all("select#date option")
+                valid_dates = [await opt.get_attribute("value") for opt in date_options if await opt.get_attribute("value")]
+                if len(valid_dates) > 0:
+                    slots_available = True
+                    available_dates = valid_dates
+                    break
+
             screenshot_path = "slot_alert.png"
             if save_screenshot:
                 await page.screenshot(path=screenshot_path)
 
-            has_busy_text = BUSY_TEXT in content
-            slots_available = not has_busy_text or (days_data is not None and len(days_data) > 0)
-
-            if slots_available:
-                log("🚨 FREE SLOTS DETECTED!")
+            if is_busy:
+                log("ℹ️ All slots are currently busy (Вибачте, на даний момент всі місця зайняті).")
+                return False
+            elif slots_available:
+                log("🚨 FREE SLOTS CONFIRMED!")
                 msg = (
                     "🎉 <b>УВАГА! З'ЯВИЛИСЯ ВІЛЬНІ МІСЦЯ В Е-ЧЕРЗІ!</b>\n\n"
                     "📍 <b>Мюнхен (Heinrich-Wieland-Straße 5)</b>\n"
                     f"Послуга: <b>{SERVICE_TEXT}</b>\n\n"
                     f"🔗 Швидше переходьте для запису: {URL}"
                 )
-                if days_data and len(days_data) > 0:
-                    msg += f"\n📅 <b>Доступні дати:</b> {days_data}"
+                if available_dates:
+                    msg += f"\n📅 <b>Доступні дати:</b> {available_dates}"
                 send_telegram(msg, screenshot_path if save_screenshot else None)
                 return True
             else:
-                log("ℹ️ All slots are currently busy (Вибачте, на даний момент всі місця зайняті).")
+                # Якщо минуло 25 секунд, а сайт все ще показує спінер (завис або повільний інтернет)
+                log("⚠️ Сайт занадто довго завантажує дані (спінер все ще крутиться). Пропускаємо, щоб не надсилати хибну тривогу.")
                 return False
 
         except Exception as e:
