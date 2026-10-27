@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import random
+import json
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -28,7 +29,6 @@ if os.name == 'nt':
         pass
 
 URL = "https://munich.pasport.org.ua/solutions/e-queue"
-BUSY_TEXT = "Вибачте, на даний момент всі місця зайняті!"
 SERVICE_TEXT = "Закордонний паспорт та (або) ID-картка"
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8956789904:AAFRFy1WlV3gzs4aj8lpq7gSFnBtQjN7si8")
@@ -69,49 +69,50 @@ async def check_slots(save_screenshot: bool = True) -> bool:
     Returns True if free slots were detected, False otherwise.
     """
     async with async_playwright() as p:
-        launch_kwargs = {
+        # Збереження профілю браузера (куки, сесія, Cloudflare clearance токени)
+        # Це запобігає блокуванню POST запитів Cloudflare захистом
+        profile_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_data")
+        os.makedirs(profile_dir, exist_ok=True)
+
+        launch_args = [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-blink-features=AutomationControlled',
+            '--disable-infobars',
+        ]
+
+        kwargs = {
+            "user_data_dir": profile_dir,
             "headless": True,
-            "args": [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-infobars',
-                '--window-size=1920,1080',
-                '--disable-extensions',
-                '--disable-dev-shm-usage',
-            ]
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "locale": "uk-UA",
+            "viewport": {"width": 1920, "height": 1080},
+            "args": launch_args,
         }
+
         chrome_win = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
         if os.name == 'nt' and os.path.exists(chrome_win):
-            launch_kwargs["executable_path"] = chrome_win
+            kwargs["executable_path"] = chrome_win
 
         try:
-            browser = await p.chromium.launch(**launch_kwargs)
+            context = await p.chromium.launch_persistent_context(**kwargs)
         except Exception as e:
             if "Executable doesn't exist" in str(e) or "playwright install" in str(e):
                 log("Chromium browser not found, automatically downloading (one-time setup)...")
                 import subprocess
                 subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-                if "executable_path" in launch_kwargs:
-                    del launch_kwargs["executable_path"]
-                browser = await p.chromium.launch(**launch_kwargs)
+                if "executable_path" in kwargs:
+                    del kwargs["executable_path"]
+                context = await p.chromium.launch_persistent_context(**kwargs)
             else:
                 raise e
-
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            locale="uk-UA",
-            viewport={"width": 1920, "height": 1080}
-        )
 
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['uk-UA', 'uk', 'en-US', 'en'] });
         """)
 
-        page = await context.new_page()
+        page = context.pages[0] if context.pages else await context.new_page()
 
         days_data = None
         rate_limited = False
@@ -121,16 +122,16 @@ async def check_slots(save_screenshot: bool = True) -> bool:
             if res.status == 429:
                 rate_limited = True
                 log("⚠️ Отримано HTTP 429 (Too many requests) від сервера.")
-            elif res.url.endswith("/solutions/e-queue") and res.request.method == "POST":
+            elif "solutions/e-queue" in res.url and res.request.method == "POST":
                 try:
                     text = await res.text()
                     if "Too many requests" in text:
                         rate_limited = True
                         log("⚠️ Сервер відхилив запит: 'Too many requests'.")
-                    else:
-                        data = await res.json()
-                        if isinstance(data, dict) and "days" in data:
-                            days_data = data["days"]
+                    elif "days" in text:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict) and "days" in parsed:
+                            days_data = parsed["days"]
                             log(f"AJAX response 'days': {days_data}")
                 except Exception:
                     pass
@@ -141,7 +142,7 @@ async def check_slots(save_screenshot: bool = True) -> bool:
             log(f"Navigating to {URL}...")
             resp = await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
 
-            # Перевірка на Rate Limiting при відкритті сторінки
+            # Перевірка на Rate Limiting
             if resp and resp.status == 429:
                 log("⚠️ Сервер повернув 429 Too many requests при завантаженні сторінки. Спробуємо в наступному циклі.")
                 return False
@@ -151,8 +152,8 @@ async def check_slots(save_screenshot: bool = True) -> bool:
                 log("⚠️ Сайт тимчасово обмежив запити (Too many requests). Спробуємо в наступному циклі.")
                 return False
 
-            # Wait up to 15s for Cloudflare or page render
-            for _ in range(15):
+            # Wait up to 10s for Cloudflare if challenge appears
+            for _ in range(10):
                 title = await page.title()
                 if "Just a moment" in title or "Cloudflare" in title:
                     log(f"Cloudflare challenge detected ('{title}'). Waiting...")
@@ -185,33 +186,9 @@ async def check_slots(save_screenshot: bool = True) -> bool:
                 await page.screenshot(path="debug_screen.png")
                 return False
 
-            # Очікуємо, поки Alpine.js прив'яжеться до форми (щоб запит не зависав зі спінером)
-            try:
-                await page.wait_for_function(
-                    '() => { const f = document.querySelector("#services"); return !!(f && f._x_dataStack && f._x_dataStack[0]); }',
-                    timeout=8000
-                )
-            except Exception:
-                pass
-
-            log(f"Selecting service: '{SERVICE_TEXT}'...")
-            try:
-                await page.select_option("select#service", label=SERVICE_TEXT)
-            except Exception:
-                await page.select_option("select#service", value="4")
-
-            # Переконуємось, що Alpine getDays спрацював
-            try:
-                await page.evaluate('''() => {
-                    const f = document.querySelector("#services");
-                    if (f && f._x_dataStack && f._x_dataStack[0]) {
-                        const alp = f._x_dataStack[0];
-                        if (alp.service !== "4") alp.service = "4";
-                        if (typeof alp.getDays === "function") alp.getDays();
-                    }
-                }''')
-            except Exception:
-                pass
+            # Вибір послуги через value '4'
+            log(f"Selecting service: '{SERVICE_TEXT}' (id 4)...")
+            await page.select_option("select#service", value="4")
 
             log("Waiting for server response and calendar slots...")
 
@@ -219,7 +196,7 @@ async def check_slots(save_screenshot: bool = True) -> bool:
             slots_available = False
             available_dates = []
 
-            for _ in range(20):
+            for _ in range(15):
                 if rate_limited:
                     log("⚠️ Запит потрапив під обмеження частоти (Rate Limit). Пропускаємо спробу.")
                     return False
@@ -234,13 +211,36 @@ async def check_slots(save_screenshot: bool = True) -> bool:
                         available_dates = days_data
                         break
 
-                # 2. Перевірка тексту повідомлення на самій сторінці
+                # 2. Пряма перевірка стану форми в Alpine.js
+                try:
+                    alpine_state = await page.evaluate('''() => {
+                        const f = document.querySelector("#services");
+                        if (f && f._x_dataStack && f._x_dataStack[0]) {
+                            const a = f._x_dataStack[0];
+                            return {
+                                show_message_dates: !!a.show_message_dates,
+                                dates_count: (a.dates && a.dates.length) || 0
+                            };
+                        }
+                        return null;
+                    }''')
+                    if alpine_state:
+                        if alpine_state["show_message_dates"]:
+                            is_busy = True
+                            break
+                        elif alpine_state["dates_count"] > 0:
+                            slots_available = True
+                            break
+                except Exception:
+                    pass
+
+                # 3. Перевірка тексту на сторінці
                 content = await page.content()
-                if BUSY_TEXT in content:
+                if "місця зайняті" in content or "зайняті" in content:
                     is_busy = True
                     break
 
-                # 3. Перевірка наявності доступних дат у випадаючому списку дат
+                # 4. Перевірка наявності доступних дат у select#date
                 date_options = await page.query_selector_all("select#date option")
                 valid_dates = [await opt.get_attribute("value") for opt in date_options if await opt.get_attribute("value")]
                 if len(valid_dates) > 0:
@@ -278,12 +278,12 @@ async def check_slots(save_screenshot: bool = True) -> bool:
             await page.screenshot(path="debug_screen.png")
             return False
         finally:
-            await browser.close()
+            await context.close()
 
 async def main():
-    parser = argparse.ArgumentParser(description="Passport Service Queue Monitor")
+    parser = argparse.ArgumentParser(description="Passport Queue Monitor")
     parser.add_argument("--loop", action="store_true", help="Run continuously in a loop")
-    parser.add_argument("--interval", type=int, default=210, help="Check interval in seconds when in loop mode (default: 210 = 3.5 min)")
+    parser.add_argument("--interval", type=int, default=300, help="Check interval in seconds when in loop mode (default: 300 = 5 min)")
     args = parser.parse_args()
 
     sys.stdout.reconfigure(encoding='utf-8')
@@ -307,7 +307,7 @@ async def main():
             except Exception as e:
                 log(f"Unexpected error in loop: {e}")
 
-            # Додаємо невеликий випадковий джитер (10-30 сек), щоб сайт не блокував через чіткий таймер робота
+            # Додаємо невеликий випадковий джитер (10-30 сек)
             jitter = random.randint(10, 30)
             sleep_time = args.interval + jitter
             log(f"Очікування {sleep_time} сек до наступної перевірки...")
